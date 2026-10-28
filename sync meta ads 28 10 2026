@@ -1,0 +1,739 @@
+// ============================================================
+// META ADS → GOOGLE SHEET v8 (bản chia sẻ — đã ẩn thông tin bảo mật)
+// - Đọc account list từ sheet "account id" (cột A = ID, cột B = Name, cột E = TRUE/FALSE)
+// - Tự động chia range thành từng tháng
+// - runCustomSync: dialog chọn account (checkbox) + chọn ngày
+// - onOpen: menu Meta Ads trên Sheet
+// - QUEUE SYNC: mỗi trigger chỉ sync 1 account, tự hẹn trigger account kế tiếp
+//
+// SETUP (KHÔNG hardcode token/ID vào code):
+//   Apps Script → Project Settings → Script Properties → thêm:
+//     META_TOKEN        = <System User access token, quyền ads_read>
+//     META_BUSINESS_ID  = <Business Manager ID>  (chỉ cần nếu muốn fallback lấy account từ BM)
+// ============================================================
+
+const CONFIG = {
+  AD_ACCOUNT_IDS  : [],        // [] = đọc từ sheet "account id"; hoặc hardcode ['act_xxx']
+  LOOKBACK_DAYS   : 2,
+  HISTORICAL_SINCE: '2026-01-01',
+  API_VERSION     : 'v21.0',
+  TIMEZONE        : 'Asia/Ho_Chi_Minh',
+  SHEET_DAILY     : 'Daily',
+  SHEET_LOG       : 'Log',
+  SHEET_ACCOUNTS  : 'account id',  // Tên sheet chứa danh sách account
+  COL_ACCOUNT_ID  : 1,             // Cột A = Account ID
+  COL_ACCOUNT_NAME: 2,             // Cột B = Account Name
+  COL_SYNC_ENABLED: 5,             // Cột E = TRUE/FALSE để bật/tắt sync (tuỳ chọn)
+};
+
+const INSIGHT_FIELDS = [
+  'date_start','date_stop',
+  'campaign_id','campaign_name',
+  'adset_id','adset_name',
+  'ad_id','ad_name',
+  'spend','reach','frequency','impressions',
+  'clicks','unique_clicks',
+  'inline_link_clicks','unique_inline_link_clicks',
+  'ctr','unique_ctr','inline_link_click_ctr',
+  'cpm','cpp','cpc','cost_per_unique_click',
+  'actions','action_values','cost_per_action_type','unique_actions',
+  'outbound_clicks','unique_outbound_clicks',
+  'video_play_actions',
+  'video_p25_watched_actions','video_p50_watched_actions',
+  'video_p75_watched_actions','video_p100_watched_actions',
+  'video_thruplay_watched_actions',
+  'video_avg_time_watched_actions',
+  'website_purchase_roas',
+  'estimated_ad_recall_rate','estimated_ad_recallers',
+  'quality_ranking','engagement_rate_ranking','conversion_rate_ranking',
+  'canvas_avg_view_time','canvas_avg_view_percent',
+].join(',');
+
+const FIXED_HEADERS = [
+  'date','account_id','account_name',
+  'campaign_id','campaign_name',
+  'adset_id','adset_name',
+  'ad_id','ad_name',
+  'spend','reach','frequency','impressions',
+  'clicks','unique_clicks','inline_link_clicks','unique_inline_link_clicks',
+  'ctr','unique_ctr','inline_link_click_ctr',
+  'cpm','cpp','cpc','cost_per_unique_click',
+  'outbound_clicks','unique_outbound_clicks',
+  'video_view','video_p25','video_p50','video_p75','video_p100',
+  'video_thruplay','video_avg_time',
+  'website_purchase_roas',
+  'estimated_ad_recall_rate','estimated_ad_recallers',
+  'quality_ranking','engagement_rate_ranking','conversion_rate_ranking',
+  'canvas_avg_view_time','canvas_avg_view_percent',
+];
+
+// ============================================================
+// MENU — tự động thêm khi mở Sheet
+// ============================================================
+
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('Meta Ads')
+    .addItem('▶ Daily Sync (2 ngày gần nhất)', 'runDailySync')
+    .addItem('▶ Historical Sync (từ ' + CONFIG.HISTORICAL_SINCE + ')', 'runHistoricalSync')
+    .addItem('▶ Custom Sync (chọn account & ngày)...', 'runCustomSync')
+    .addSeparator()
+    .addItem('⏩ Queue Daily (từng account)', 'startQueueDaily')
+    .addItem('⏩ Queue Historical (từng account)', 'startQueueHistorical')
+    .addItem('📊 Trạng thái queue', 'Q_status')
+    .addItem('🛑 Huỷ queue', 'Q_cancel')
+    .addSeparator()
+    .addItem('🔍 Test Connection', 'testConnection')
+    .addItem('🧹 Fix Duplicates (chạy 1 lần)', 'fixDuplicates')
+    .addToUi();
+}
+
+// ============================================================
+// HÀM CHÍNH
+// ============================================================
+
+function runHistoricalSync() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  logMsg(ss, '▶ Historical Sync...');
+  var accounts = getAllAdAccounts();
+  var since = CONFIG.HISTORICAL_SINCE;
+  var until = _today();
+  logMsg(ss, accounts.length + ' accounts | ' + since + ' → ' + until);
+  _syncAccounts(ss, accounts, since, until);
+}
+
+function runDailySync() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  logMsg(ss, '▶ Daily Sync...');
+  var accounts = getAllAdAccounts();
+  var since = _formatDate(_daysAgo(CONFIG.LOOKBACK_DAYS));
+  var until = _today();
+  logMsg(ss, accounts.length + ' accounts | ' + since + ' → ' + until);
+  _syncAccounts(ss, accounts, since, until);
+}
+
+/** Chạy từ menu Sheet — hiện dialog chọn account (checkbox) + ngày */
+function runCustomSync() {
+  var accounts = getAllAdAccounts();
+  var html = HtmlService.createHtmlOutput(_buildCustomSyncHtml(accounts))
+    .setWidth(420).setHeight(540);
+  SpreadsheetApp.getUi().showModalDialog(html, 'Custom Sync — Chọn account & ngày');
+}
+
+/** Build HTML cho dialog Custom Sync */
+function _buildCustomSyncHtml(accounts) {
+  var rows = accounts.map(function(a) {
+    return '<label style="display:block;margin:4px 0;font-size:13px">' +
+      '<input type="checkbox" class="acc" value="' + a.id + '" checked> ' +
+      a.name + ' (' + a.id + ')</label>';
+  }).join('');
+
+  return '<div style="font-family:Arial,sans-serif;padding:8px">' +
+    '<div style="margin-bottom:10px">' +
+      '<label>Từ ngày: <input type="date" id="since" value="' + CONFIG.HISTORICAL_SINCE + '"></label><br><br>' +
+      '<label>Đến ngày: <input type="date" id="until" value="' + _today() + '"></label>' +
+    '</div>' +
+    '<div style="margin-bottom:8px">' +
+      '<button onclick="toggleAll(true)" style="margin-right:6px">Chọn tất cả</button>' +
+      '<button onclick="toggleAll(false)">Bỏ chọn tất cả</button>' +
+    '</div>' +
+    '<div style="max-height:260px;overflow-y:auto;border:1px solid #ccc;padding:8px">' + rows + '</div>' +
+    '<br><button onclick="submitForm()" style="background:#1877F2;color:white;padding:8px 16px;border:none;border-radius:4px;cursor:pointer">▶ Chạy Sync</button>' +
+    '<div id="status" style="margin-top:8px;color:#555;font-size:12px"></div>' +
+    '<script>' +
+      'function toggleAll(v){document.querySelectorAll(".acc").forEach(function(c){c.checked=v;});}' +
+      'function submitForm(){' +
+        'var ids=[].slice.call(document.querySelectorAll(".acc:checked")).map(function(c){return c.value;});' +
+        'var since=document.getElementById("since").value;' +
+        'var until=document.getElementById("until").value;' +
+        'if(ids.length===0){alert("Chọn ít nhất 1 account");return;}' +
+        'if(!since||!until||since>until){alert("Ngày không hợp lệ");return;}' +
+        'document.getElementById("status").innerText="Đang chạy... theo dõi tiến trình trong sheet Log";' +
+        'google.script.run.withSuccessHandler(function(){google.script.host.close();})' +
+          '.withFailureHandler(function(e){alert("Lỗi: "+e.message);})' +
+          '.processCustomSync(ids, since, until);' +
+      '}' +
+    '</' + 'script>' +
+  '</div>';
+}
+
+/** Server-side: nhận list account_id đã chọn từ dialog + chạy sync */
+function processCustomSync(accountIds, since, until) {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var allAccounts = getAllAdAccounts();
+  var selected = allAccounts.filter(function(a) { return accountIds.indexOf(a.id) !== -1; });
+  if (selected.length === 0) throw new Error('Không có account nào được chọn');
+  logMsg(ss, '▶ Custom Sync: ' + since + ' → ' + until + ' | ' + selected.length + '/' + allAccounts.length + ' accounts');
+  _syncAccounts(ss, selected, since, until);
+}
+
+/** Xóa duplicate trong sheet Daily — chạy 1 lần để fix data cũ */
+function fixDuplicates() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName(CONFIG.SHEET_DAILY);
+  if (!sheet || sheet.getLastRow() <= 1) { Logger.log('Sheet trống'); return; }
+
+  var data = sheet.getDataRange().getValues();
+  var headers = data[0];
+
+  var dateIdx = headers.indexOf('date');
+  var accIdx  = headers.indexOf('account_id');
+  var adIdx   = headers.indexOf('ad_id');
+
+  if (dateIdx < 0 || accIdx < 0 || adIdx < 0) { Logger.log('Không tìm thấy key columns'); return; }
+
+  var seen = {};
+  var kept = [headers];
+  var dupCount = 0;
+
+  for (var r = 1; r < data.length; r++) {
+    var key = String(data[r][dateIdx]).trim() + '|'
+            + String(data[r][accIdx]).trim() + '|'
+            + String(data[r][adIdx]).trim();
+    if (seen[key]) { dupCount++; continue; }
+    seen[key] = true;
+    kept.push(data[r]);
+  }
+
+  sheet.clearContents();
+  sheet.getRange(1, 1, kept.length, kept[0].length).setValues(kept);
+  _formatHeader(sheet);
+  _sortByDate(sheet);
+  Logger.log('✅ Đã xóa ' + dupCount + ' dòng duplicate. Còn lại: ' + (kept.length - 1) + ' dòng');
+}
+
+function testConnection() {
+  var accounts = getAllAdAccounts();
+  var lines = accounts.map(function(a) { return '• ' + a.name + ' (' + a.id + ')'; });
+  var msg = '✅ ' + accounts.length + ' accounts:\n\n' + lines.join('\n');
+  Logger.log(msg);
+  try { SpreadsheetApp.getUi().alert(msg); } catch(e) {}
+}
+
+// ============================================================
+// AD ACCOUNTS — đọc từ sheet "account id" hoặc CONFIG
+// ============================================================
+
+function getAllAdAccounts() {
+  // Ưu tiên 1: hardcode trong CONFIG
+  if (CONFIG.AD_ACCOUNT_IDS.length > 0) {
+    return CONFIG.AD_ACCOUNT_IDS.map(function(id) { return { id: 'act_' + id.replace('act_',''), name: id }; });
+  }
+
+  // Ưu tiên 2: đọc từ sheet "account id"
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName(CONFIG.SHEET_ACCOUNTS);
+  if (sheet && sheet.getLastRow() > 1) {
+    var data = sheet.getRange(2, 1, sheet.getLastRow() - 1, Math.max(CONFIG.COL_SYNC_ENABLED, CONFIG.COL_ACCOUNT_NAME)).getValues();
+    var accounts = [];
+    for (var i = 0; i < data.length; i++) {
+      var rawId = String(data[i][CONFIG.COL_ACCOUNT_ID - 1]).trim();
+      var name  = String(data[i][CONFIG.COL_ACCOUNT_NAME - 1]).trim() || rawId;
+      if (!rawId || rawId === '') continue;
+      var enabled = data[i][CONFIG.COL_SYNC_ENABLED - 1];
+      if (enabled !== '' && enabled !== true && String(enabled).toUpperCase() !== 'TRUE') continue;
+      var id = rawId.indexOf('act_') === 0 ? rawId : 'act_' + rawId;
+      accounts.push({ id: id, name: name });
+    }
+    if (accounts.length > 0) return accounts;
+  }
+
+  // Fallback: lấy từ BM
+  return _getAccountsFromBM();
+}
+
+function _getAccountsFromBM() {
+  var bmId = _getBusinessId();
+  if (!bmId) throw new Error('Chưa có account trong sheet "' + CONFIG.SHEET_ACCOUNTS + '" và chưa set META_BUSINESS_ID trong Script Properties.');
+  var accounts = [];
+  var endpoints = ['owned_ad_accounts', 'client_ad_accounts'];
+  for (var e = 0; e < endpoints.length; e++) {
+    var url = 'https://graph.facebook.com/' + CONFIG.API_VERSION
+      + '/' + bmId + '/' + endpoints[e]
+      + '?fields=id,name,account_status&limit=100&access_token=' + encodeURIComponent(_getToken());
+    var resp = JSON.parse(UrlFetchApp.fetch(url, { muteHttpExceptions: true }).getContentText());
+    if (resp.error) { Logger.log('⚠️ ' + endpoints[e] + ': ' + resp.error.message); continue; }
+    if (resp.data) {
+      var active = resp.data.filter(function(a) { return a.account_status === 1; });
+      for (var i = 0; i < active.length; i++) accounts.push({ id: active[i].id, name: active[i].name });
+    }
+  }
+  var seen = {}, deduped = [];
+  for (var j = 0; j < accounts.length; j++) {
+    if (!seen[accounts[j].id]) { seen[accounts[j].id] = true; deduped.push(accounts[j]); }
+  }
+  if (deduped.length === 0) throw new Error('Không tìm thấy ad account nào.');
+  return deduped;
+}
+
+// ============================================================
+// CORE — chia từng tháng, catch lỗi từng account
+// ============================================================
+
+function _syncAccounts(ss, accounts, since, until) {
+  var ok = [];
+  var failed = [];
+  var chunks = _splitIntoMonths(since, until);
+
+  if (chunks.length > 1) logMsg(ss, 'Chia thành ' + chunks.length + ' tháng');
+
+  for (var i = 0; i < accounts.length; i++) {
+    var acc = accounts[i];
+    var accRows = 0;
+    var accError = null;
+
+    for (var c = 0; c < chunks.length; c++) {
+      var attempt = 0;
+      var success = false;
+      while (attempt < 2 && !success) {
+        try {
+          var rows = _pullToDaily(ss, acc, chunks[c][0], chunks[c][1]);
+          accRows += rows;
+          success = true;
+          if (chunks.length > 1) Utilities.sleep(500);
+        } catch (e) {
+          attempt++;
+          var parsed = _parseApiError(e.message, acc.id);
+          if (attempt < 2 && _isTransientError(e.message)) {
+            logMsg(ss, '  ⚠️ ' + acc.name + ' [' + chunks[c][0] + '→' + chunks[c][1] + ']: lỗi tạm thời, thử lại...');
+            Utilities.sleep(3000);
+            continue;
+          }
+          accError = parsed;
+          logMsg(ss, '  ❌ ' + acc.name + ' [' + chunks[c][0] + '→' + chunks[c][1] + ']: ' + accError);
+          break;
+        }
+      }
+      if (accError) break;
+    }
+
+    if (!accError) {
+      ok.push(acc.name + ' (' + acc.id + '): ' + accRows + ' dòng');
+    } else {
+      failed.push({ name: acc.name, id: acc.id, reason: accError });
+    }
+
+    if (i < accounts.length - 1) Utilities.sleep(1500);
+  }
+
+  logMsg(ss, '─────────────────────────────');
+  logMsg(ss, '✅ OK: ' + ok.length + '/' + accounts.length + ' accounts');
+  for (var j = 0; j < ok.length; j++) logMsg(ss, '   • ' + ok[j]);
+  if (failed.length > 0) {
+    logMsg(ss, '❌ Lỗi: ' + failed.length + '/' + accounts.length + ' accounts');
+    for (var k = 0; k < failed.length; k++) {
+      logMsg(ss, '   • ' + failed[k].name + ' (' + failed[k].id + ')');
+      logMsg(ss, '     ' + failed[k].reason);
+    }
+  }
+  logMsg(ss, '─────────────────────────────');
+}
+
+/** code:1/subcode:99 là lỗi transient phía Meta — retry trước khi báo lỗi thật */
+function _isTransientError(msg) {
+  return msg.indexOf('code:1|subcode:99') !== -1;
+}
+
+function _splitIntoMonths(since, until) {
+  var chunks = [];
+  var start = new Date(since + 'T00:00:00');
+  var end   = new Date(until + 'T00:00:00');
+  while (start <= end) {
+    var chunkStart = _formatDate(start);
+    var lastDay    = new Date(start.getFullYear(), start.getMonth() + 1, 0);
+    var chunkEnd   = _formatDate(lastDay < end ? lastDay : end);
+    chunks.push([chunkStart, chunkEnd]);
+    start = new Date(start.getFullYear(), start.getMonth() + 1, 1);
+  }
+  return chunks;
+}
+
+// ============================================================
+// PULL DATA
+// ============================================================
+
+function _pullToDaily(ss, acc, since, until) {
+  var sheet = _getOrCreateSheet(ss, CONFIG.SHEET_DAILY);
+  var token     = _getToken();
+  var timeRange = JSON.stringify({ since: since, until: until });
+  var url = 'https://graph.facebook.com/' + CONFIG.API_VERSION + '/' + acc.id + '/insights'
+    + '?access_token=' + encodeURIComponent(token)
+    + '&level=ad'
+    + '&fields=' + encodeURIComponent(INSIGHT_FIELDS)
+    + '&time_range=' + encodeURIComponent(timeRange)
+    + '&time_increment=1'
+    + '&limit=500';
+
+  var allData = [];
+  var pageCount = 0;
+
+  while (url) {
+    var resp = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+    if (resp.getResponseCode() === 429) {
+      logMsg(ss, '  ⏳ Rate limit [' + acc.name + '], chờ 60s...');
+      Utilities.sleep(60000);
+      continue;
+    }
+    var json = JSON.parse(resp.getContentText());
+    if (json.error) {
+      throw new Error(
+        'META_API_ERROR|code:' + json.error.code
+        + '|subcode:' + (json.error.error_subcode || 'none')
+        + '|type:' + (json.error.type || 'unknown')
+        + '|msg:' + json.error.message
+      );
+    }
+    if (json.data && json.data.length > 0) {
+      for (var i = 0; i < json.data.length; i++) allData.push(json.data[i]);
+    }
+    url = (json.paging && json.paging.next) ? json.paging.next : null;
+    pageCount++;
+    if (url) Utilities.sleep(300);
+  }
+
+  if (allData.length === 0) {
+    logMsg(ss, '  ⚠️ ' + acc.name + ' [' + since + '→' + until + ']: không có data');
+    return 0;
+  }
+
+  var rows = allData.map(function(row) { return _flattenRow(row, acc.id, acc.name); });
+  _upsertRows(sheet, rows, ['date', 'account_id', 'ad_id']);
+  logMsg(ss, '  ✓ ' + acc.name + ' [' + since + '→' + until + ']: ' + rows.length + ' dòng (' + pageCount + ' pages)');
+  return rows.length;
+}
+
+// ============================================================
+// PARSE LỖI
+// ============================================================
+
+function _parseApiError(msg, accId) {
+  if (msg.indexOf('META_API_ERROR|') === -1) return msg;
+  var code    = (msg.match(/code:(\d+)/)    || [])[1] || '?';
+  var subcode = (msg.match(/subcode:(\w+)/) || [])[1] || 'none';
+  var detail  = (msg.match(/msg:(.+)/)      || [])[1] || msg;
+  var hint = '';
+  switch (code) {
+    case '1':
+      hint = (subcode === '99')
+        ? 'Lỗi tạm thời phía Meta (đã retry nhưng vẫn lỗi) — kiểm tra System User đã add vào account chưa, hoặc account có thuộc đúng BM không'
+        : 'Account bị restricted hoặc System User chưa được add vào account trong BM';
+      break;
+    case '2':   hint = 'Service tạm thời không khả dụng — thử lại sau'; break;
+    case '4':   hint = 'App rate limit — chờ 1 tiếng rồi chạy lại'; break;
+    case '10':  hint = 'Permission denied — token thiếu ads_read hoặc ads_management'; break;
+    case '17':  hint = 'User request limit — chạy lại sau 10 phút'; break;
+    case '100': hint = 'Invalid parameter — kiểm tra account ID format act_XXXXX'; break;
+    case '190': hint = 'Token hết hạn — cập nhật META_TOKEN trong Script Properties'; break;
+    case '200': hint = 'API access blocked — app ở Development mode hoặc chưa pass App Review'; break;
+    case '273': hint = 'Account không thuộc BM hoặc không đủ quyền'; break;
+    default:    hint = 'Xem: https://developers.facebook.com/docs/graph-api/guides/error-handling';
+  }
+  return '[code:' + code + (subcode !== 'none' ? '/sub:' + subcode : '') + '] ' + detail + ' → ' + hint;
+}
+
+// ============================================================
+// DATA FLATTEN
+// ============================================================
+
+function _flattenRow(row, accountId, accountName) {
+  var flat = {};
+  flat['date']         = String(row['date_start'] || '').trim();
+  flat['account_id']   = String(accountId || '').trim();
+  flat['account_name'] = String(accountName || '').trim();
+
+  var scalars = [
+    'campaign_id','campaign_name','adset_id','adset_name','ad_id','ad_name',
+    'spend','reach','frequency','impressions',
+    'clicks','unique_clicks','inline_link_clicks','unique_inline_link_clicks',
+    'ctr','unique_ctr','inline_link_click_ctr','cpm','cpp','cpc','cost_per_unique_click',
+    'estimated_ad_recall_rate','estimated_ad_recallers',
+    'quality_ranking','engagement_rate_ranking','conversion_rate_ranking',
+    'canvas_avg_view_time','canvas_avg_view_percent',
+  ];
+  for (var i = 0; i < scalars.length; i++) {
+    var v = row[scalars[i]];
+    flat[scalars[i]] = (v !== undefined && v !== null) ? String(v).trim() : '';
+  }
+
+  flat['video_view']             = _firstVal(row.video_play_actions);
+  flat['video_p25']              = _firstVal(row.video_p25_watched_actions);
+  flat['video_p50']              = _firstVal(row.video_p50_watched_actions);
+  flat['video_p75']              = _firstVal(row.video_p75_watched_actions);
+  flat['video_p100']             = _firstVal(row.video_p100_watched_actions);
+  flat['video_thruplay']         = _firstVal(row.video_thruplay_watched_actions);
+  flat['video_avg_time']         = _firstVal(row.video_avg_time_watched_actions);
+  flat['outbound_clicks']        = _findAction(row.outbound_clicks, 'outbound_click');
+  flat['unique_outbound_clicks'] = _findAction(row.unique_outbound_clicks, 'outbound_click');
+  flat['website_purchase_roas']  = _findAction(row.website_purchase_roas, 'offsite_conversion.fb_pixel_purchase');
+
+  var actionArrays = { actions: row.actions, action_values: row.action_values, cost_per_action: row.cost_per_action_type, unique_actions: row.unique_actions };
+  var allTypes = {};
+  var keys = Object.keys(actionArrays);
+  for (var k = 0; k < keys.length; k++) {
+    var arr = actionArrays[keys[k]];
+    if (Array.isArray(arr)) for (var j = 0; j < arr.length; j++) allTypes[arr[j].action_type] = true;
+  }
+  var types = Object.keys(allTypes);
+  for (var t = 0; t < types.length; t++) {
+    var type = types[t], col = type.replace(/\./g, '_');
+    flat['action_' + col] = _findAction(row.actions, type);
+    flat['value_' + col]  = _findAction(row.action_values, type);
+    flat['cost_' + col]   = _findAction(row.cost_per_action_type, type);
+    flat['unique_' + col] = _findAction(row.unique_actions, type);
+  }
+  return flat;
+}
+
+function _findAction(arr, type) {
+  if (!Array.isArray(arr)) return '';
+  for (var i = 0; i < arr.length; i++) if (arr[i].action_type === type) return arr[i].value !== undefined ? arr[i].value : '';
+  return '';
+}
+
+function _firstVal(arr) {
+  if (!Array.isArray(arr) || arr.length === 0) return '';
+  return arr[0].value !== undefined ? arr[0].value : '';
+}
+
+// ============================================================
+// SHEET HELPERS
+// ============================================================
+
+function _getOrCreateSheet(ss, name) {
+  return ss.getSheetByName(name) || ss.insertSheet(name);
+}
+
+function _upsertRows(sheet, newRows, keyColumns) {
+  if (newRows.length === 0) return;
+  var newKeySet = {};
+  for (var i = 0; i < newRows.length; i++) newKeySet[_buildKey(newRows[i], keyColumns)] = true;
+  var allHeaders = _mergeHeaders(sheet, newRows);
+  if (sheet.getLastRow() === 0) { _writeAll(sheet, allHeaders, newRows); return; }
+  var existingData    = sheet.getDataRange().getValues();
+  var existingDisplay = sheet.getDataRange().getDisplayValues(); // dùng để build key — tránh float conversion
+  var oldHeaders = existingData[0].map(function(h) { return String(h).trim(); });
+  var kept = [];
+  for (var r = 1; r < existingData.length; r++) {
+    var keyObj = {};
+    for (var c = 0; c < oldHeaders.length; c++) if (oldHeaders[c]) keyObj[oldHeaders[c]] = String(existingDisplay[r][c]).trim();
+    if (newKeySet[_buildKey(keyObj, keyColumns)]) continue;
+    var obj = {};
+    for (var c = 0; c < oldHeaders.length; c++) if (oldHeaders[c]) obj[oldHeaders[c]] = existingData[r][c];
+    kept.push(obj);
+  }
+  var finalData = [allHeaders];
+  for (var k = 0; k < kept.length; k++) finalData.push(allHeaders.map(function(h) { return kept[k][h] !== undefined ? kept[k][h] : ''; }));
+  for (var n = 0; n < newRows.length; n++) finalData.push(allHeaders.map(function(h) { return newRows[n][h] !== undefined ? newRows[n][h] : ''; }));
+  _setIdColumnsTextFormat(sheet, allHeaders, finalData.length);
+  sheet.clearContents();
+  sheet.getRange(1, 1, finalData.length, finalData[0].length).setValues(finalData);
+  _formatHeader(sheet);
+  _sortByDate(sheet);
+}
+
+function _writeAll(sheet, headers, rows) {
+  var data = [headers];
+  for (var i = 0; i < rows.length; i++) data.push(headers.map(function(h) { return rows[i][h] !== undefined ? rows[i][h] : ''; }));
+  _setIdColumnsTextFormat(sheet, headers, data.length);
+  sheet.getRange(1, 1, data.length, data[0].length).setValues(data);
+  _formatHeader(sheet);
+  _sortByDate(sheet);
+}
+
+/** Sort cột date (cột 1) descending — dữ liệu mới nhất lên đầu */
+function _sortByDate(sheet) {
+  if (sheet.getLastRow() <= 2) return;
+  var dataRange = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn());
+  dataRange.sort({ column: 1, ascending: false });
+}
+
+function _mergeHeaders(sheet, rows) {
+  var seen = {}, result = [];
+  for (var f = 0; f < FIXED_HEADERS.length; f++) { seen[FIXED_HEADERS[f]] = true; result.push(FIXED_HEADERS[f]); }
+  if (sheet.getLastRow() > 0) {
+    var ex = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+    for (var i = 0; i < ex.length; i++) { var h = String(ex[i]).trim(); if (h && !seen[h]) { seen[h] = true; result.push(h); } }
+  }
+  for (var r = 0; r < rows.length; r++) {
+    var keys = Object.keys(rows[r]);
+    for (var k = 0; k < keys.length; k++) if (!seen[keys[k]]) { seen[keys[k]] = true; result.push(keys[k]); }
+  }
+  return result;
+}
+
+function _buildKey(obj, cols) {
+  return cols.map(function(c) { return String(obj[c] !== undefined ? obj[c] : '').trim(); }).join('|');
+}
+
+/** Format cột ID số lớn về Plain Text TRƯỚC khi ghi — tránh Sheets convert float mất precision */
+function _setIdColumnsTextFormat(sheet, headers, totalRows) {
+  if (totalRows <= 1) return;
+  var idCols = ['ad_id', 'adset_id', 'campaign_id', 'account_id'];
+  for (var i = 0; i < headers.length; i++) {
+    if (idCols.indexOf(String(headers[i]).trim()) >= 0) {
+      sheet.getRange(2, i + 1, totalRows - 1, 1).setNumberFormat('@STRING@');
+    }
+  }
+}
+
+function _formatHeader(sheet) {
+  if (sheet.getLastColumn() === 0) return;
+  sheet.getRange(1, 1, 1, sheet.getLastColumn()).setBackground('#1877F2').setFontColor('#FFFFFF').setFontWeight('bold');
+  sheet.setFrozenRows(1);
+}
+
+// ============================================================
+// LOG & UTILS
+// ============================================================
+
+function logMsg(ss, msg) {
+  console.log(msg);
+  var sheet = _getOrCreateSheet(ss, CONFIG.SHEET_LOG);
+  sheet.appendRow([new Date(), msg]);
+  if (sheet.getLastRow() > 1000) sheet.deleteRow(2);
+}
+
+/** Token chỉ lấy từ Script Properties — không hardcode */
+function _getToken() {
+  var t = PropertiesService.getScriptProperties().getProperty('META_TOKEN');
+  if (!t) throw new Error('Chưa set META_TOKEN trong Project Settings → Script Properties');
+  return t;
+}
+
+function _getBusinessId() {
+  return PropertiesService.getScriptProperties().getProperty('META_BUSINESS_ID') || '';
+}
+
+function _today() { return _formatDate(new Date()); }
+
+function _daysAgo(n) { var d = new Date(); d.setDate(d.getDate() - n); return d; }
+
+function _formatDate(d) { return Utilities.formatDate(d, CONFIG.TIMEZONE, 'yyyy-MM-dd'); }
+
+// ============================================================
+// QUEUE SYNC — mỗi trigger chỉ sync 1 account, tự hẹn trigger account kế tiếp
+// ============================================================
+
+const QUEUE = {
+  PROP_KEY      : 'META_QUEUE',
+  HANDLER       : 'Q_processNext',
+  DELAY_MS      : 60 * 1000,      // nghỉ giữa 2 account (after() tối thiểu ~1 phút)
+  SAFETY_MS     : 7 * 60 * 1000,  // trigger dự phòng nếu execution bị kill ở 6 phút
+  DAILY_HOUR    : 6,              // giờ chạy queue daily tự động
+};
+
+/** Khởi động queue Daily (gắn time-driven trigger hằng ngày vào hàm này) */
+function startQueueDaily() {
+  Q_start_(_formatDate(_daysAgo(CONFIG.LOOKBACK_DAYS)), _today(), 'Daily');
+}
+
+/** Khởi động queue Historical */
+function startQueueHistorical() {
+  Q_start_(CONFIG.HISTORICAL_SINCE, _today(), 'Historical');
+}
+
+function Q_start_(since, until, label) {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var props = PropertiesService.getScriptProperties();
+  if (props.getProperty(QUEUE.PROP_KEY)) {
+    logMsg(ss, '⚠️ [Queue] Đang có queue chạy dở — bỏ qua. Dùng "Huỷ queue" nếu muốn chạy lại.');
+    return;
+  }
+  var accounts = getAllAdAccounts();
+  var state = {
+    label: label, since: since, until: until,
+    accounts: accounts, idx: 0, failed: [],
+    startedAt: new Date().toISOString()
+  };
+  props.setProperty(QUEUE.PROP_KEY, JSON.stringify(state));
+  logMsg(ss, '▶ [Queue ' + label + '] ' + accounts.length + ' accounts | ' + since + ' → ' + until);
+  Q_clearTriggers_();
+  Q_scheduleNext_(1000);
+}
+
+/** Handler của trigger — mỗi lần chạy xử lý đúng 1 account */
+function Q_processNext() {
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(30000)) return; // đã có execution khác giữ lock
+  try {
+    Q_clearTriggers_();
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var props = PropertiesService.getScriptProperties();
+    var raw = props.getProperty(QUEUE.PROP_KEY);
+    if (!raw) return;
+    var state = JSON.parse(raw);
+
+    // Hết danh sách → kết thúc
+    if (state.idx >= state.accounts.length) {
+      props.deleteProperty(QUEUE.PROP_KEY);
+      logMsg(ss, '🏁 [Queue ' + state.label + '] Hoàn tất ' + state.accounts.length + ' accounts'
+        + (state.failed.length ? ' | Bị timeout/lỗi: ' + state.failed.join(', ') : ''));
+      return;
+    }
+
+    var acc = state.accounts[state.idx];
+    var pos = (state.idx + 1) + '/' + state.accounts.length;
+
+    // Tăng idx + hẹn trigger dự phòng TRƯỚC khi sync (phòng bị kill 6 phút)
+    state.idx++;
+    state.failed.push(acc.name);           // tạm đánh dấu, gỡ ra nếu chạy xong
+    props.setProperty(QUEUE.PROP_KEY, JSON.stringify(state));
+    Q_scheduleNext_(QUEUE.SAFETY_MS);
+
+    logMsg(ss, '▶ [Queue ' + state.label + '] ' + pos + ': ' + acc.name + ' (' + acc.id + ')');
+    try {
+      _syncAccounts(ss, [acc], state.since, state.until);
+      state.failed.pop();                  // chạy xong → gỡ đánh dấu
+    } catch (e) {
+      logMsg(ss, '❌ [Queue] ' + acc.name + ': ' + e.message);
+    }
+
+    props.setProperty(QUEUE.PROP_KEY, JSON.stringify(state));
+    Q_clearTriggers_();                    // xoá trigger dự phòng
+    Q_scheduleNext_(QUEUE.DELAY_MS);       // hẹn account kế tiếp
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/** Xem tiến độ queue */
+function Q_status() {
+  var raw = PropertiesService.getScriptProperties().getProperty(QUEUE.PROP_KEY);
+  var msg = raw
+    ? (function(s) {
+        return 'Queue ' + s.label + ': ' + s.idx + '/' + s.accounts.length + ' accounts\n'
+          + s.since + ' → ' + s.until + '\nBắt đầu: ' + s.startedAt
+          + (s.idx < s.accounts.length ? '\nKế tiếp: ' + s.accounts[s.idx].name : '');
+      })(JSON.parse(raw))
+    : 'Không có queue nào đang chạy';
+  Logger.log(msg);
+  try { SpreadsheetApp.getUi().alert(msg); } catch(e) {}
+}
+
+/** Huỷ queue đang chạy */
+function Q_cancel() {
+  PropertiesService.getScriptProperties().deleteProperty(QUEUE.PROP_KEY);
+  Q_clearTriggers_();
+  logMsg(SpreadsheetApp.getActiveSpreadsheet(), '🛑 [Queue] Đã huỷ');
+}
+
+/** Cài trigger hằng ngày cho startQueueDaily (chạy 1 lần) */
+function Q_installDailyTrigger() {
+  ScriptApp.getProjectTriggers().forEach(function(t) {
+    var fn = t.getHandlerFunction();
+    if (fn === 'startQueueDaily' || fn === 'runDailySync') ScriptApp.deleteTrigger(t);
+  });
+  ScriptApp.newTrigger('startQueueDaily').timeBased()
+    .everyDays(1).atHour(QUEUE.DAILY_HOUR).inTimezone(CONFIG.TIMEZONE).create();
+  logMsg(SpreadsheetApp.getActiveSpreadsheet(), '✅ [Queue] Đã cài trigger daily lúc ' + QUEUE.DAILY_HOUR + 'h');
+}
+
+function Q_scheduleNext_(ms) {
+  ScriptApp.newTrigger(QUEUE.HANDLER).timeBased().after(ms).create();
+}
+
+function Q_clearTriggers_() {
+  ScriptApp.getProjectTriggers().forEach(function(t) {
+    if (t.getHandlerFunction() === QUEUE.HANDLER) ScriptApp.deleteTrigger(t);
+  });
+}
